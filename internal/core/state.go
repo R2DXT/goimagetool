@@ -1,0 +1,132 @@
+package core
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"goimagetool/internal/compress"
+	"goimagetool/internal/fs/memfs"
+	"goimagetool/internal/image/cpio"
+	"goimagetool/internal/image/uboot/legacy"
+)
+
+type ImageKind int
+const (
+	KindNone ImageKind = iota
+	KindInitramfs
+	KindKernelLegacy
+)
+
+type State struct {
+	Kind ImageKind
+	FS   *memfs.FS
+	Meta any
+	Raw  []byte
+}
+
+func New() *State { return &State{Kind: KindNone, FS: memfs.New()} }
+
+func (s *State) LoadInitramfs(path string, compression string) error {
+	b, err := os.ReadFile(path)
+	if err != nil { return err }
+	var r io.Reader = bytes.NewReader(b)
+	if compression == "gzip" || strings.EqualFold(compression, "gz") {
+		var out bytes.Buffer
+		if err := compress.GzipDecompress(&out, r); err != nil { return fmt.Errorf("gzip: %w", err) }
+		r = bytes.NewReader(out.Bytes())
+	}
+	fs, err := cpio.LoadNewc(r)
+	if err != nil { return err }
+	s.Kind = KindInitramfs
+	s.FS = fs
+	s.Meta = nil
+	s.Raw = nil
+	return nil
+}
+
+func (s *State) StoreInitramfs(path string, compression string) error {
+	var buf bytes.Buffer
+	if err := cpio.StoreNewc(&buf, s.FS); err != nil { return err }
+	var out []byte
+	if compression == "gzip" || strings.EqualFold(compression, "gz") {
+		var gz bytes.Buffer
+		if err := compress.GzipCompress(&gz, bytes.NewReader(buf.Bytes())); err != nil { return err }
+		out = gz.Bytes()
+	} else {
+		out = buf.Bytes()
+	}
+	return os.WriteFile(path, out, 0644)
+}
+
+func (s *State) LoadKernelLegacy(path string) error {
+	f, err := os.Open(path); if err != nil { return err }
+	defer f.Close()
+	h, data, err := legacy.Read(f)
+	if err != nil { return err }
+	s.Kind = KindKernelLegacy
+	s.FS = memfs.New()
+	s.Meta = h
+	s.Raw = data
+	return nil
+}
+
+func (s *State) StoreKernelLegacy(path string) error {
+	f, err := os.Create(path); if err != nil { return err }
+	defer f.Close()
+	h, _ := s.Meta.(*legacy.Header)
+	if h == nil { return errors.New("no uImage header") }
+	return legacy.Write(f, h, s.Raw)
+}
+
+func (s *State) FSAddLocal(src, dst string) error {
+	dst = filepath.ToSlash(dst)
+	info, err := os.Stat(src)
+	if err != nil { return err }
+	if info.IsDir() {
+		return filepath.Walk(src, func(p string, fi os.FileInfo, err error) error {
+			if err != nil { return err }
+			rel, _ := filepath.Rel(src, p)
+			out := filepath.ToSlash(filepath.Join(dst, rel))
+			if fi.IsDir() {
+				s.FS.PutDir(out, 0, 0, fi.ModTime())
+				return nil
+			}
+			data, err := os.ReadFile(p); if err != nil { return err }
+			s.FS.PutFile(out, data, memfs.Mode(0100644), 0, 0, fi.ModTime())
+			return nil
+		})
+	} else {
+		data, err := os.ReadFile(src); if err != nil { return err }
+		s.FS.PutFile(dst, data, memfs.Mode(0100644), 0, 0, info.ModTime())
+		return nil
+	}
+}
+
+func (s *State) FSExtract(dst string) error {
+	return s.FS.Walk(func(e *memfs.Entry) error {
+		if e.Name == "/" { return nil }
+		out := filepath.Join(dst, strings.TrimPrefix(e.Name, "/"))
+		if e.Mode & memfs.ModeDir != 0 {
+			return os.MkdirAll(out, 0755)
+		}
+		if err := os.MkdirAll(filepath.Dir(out), 0755); err != nil { return err }
+		return os.WriteFile(out, e.Data, 0644)
+	})
+}
+
+func (s *State) Info() string {
+	switch s.Kind {
+	case KindInitramfs:
+		return "Kind: initramfs (cpio)"
+	case KindKernelLegacy:
+		if h, _ := s.Meta.(*legacy.Header); h != nil {
+			return "Kind: kernel-legacy\n" + h.String()
+		}
+	}
+	return "Kind: none"
+}
