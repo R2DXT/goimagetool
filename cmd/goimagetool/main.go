@@ -13,13 +13,20 @@ func usage() {
 Usage:
   goimagetool load initramfs <path> [compression]     # compression: none|gzip
   goimagetool load kernel-legacy <uImagePath>
+  goimagetool load kernel-fit <itbPath>
+  goimagetool load ext2 <imgPath>
 
   goimagetool store initramfs <path> [compression]
   goimagetool store kernel-legacy <uImagePath>
+  goimagetool store kernel-fit <itbPath>
+  goimagetool store ext2 <imgPath> [blockSize]
 
   goimagetool fs ls [path]
   goimagetool fs add <srcPath> <dstPathInImage>
   goimagetool fs extract <dstDir>
+
+  goimagetool fit ls
+  goimagetool fit extract <imageName> <outPath>
 
   goimagetool info
   goimagetool help
@@ -45,11 +52,16 @@ func main() {
 			p := args[i+2]
 			comp := "none"
 			if typ == "initramfs" && i+3 < len(args) { comp = args[i+3]; i++ }
-			if typ == "initramfs" {
+			switch typ {
+			case "initramfs":
 				if err := st.LoadInitramfs(p, comp); err != nil { fmt.Fprintln(os.Stderr, "load:", err); os.Exit(2) }
-			} else if typ == "kernel-legacy" {
+			case "kernel-legacy":
 				if err := st.LoadKernelLegacy(p); err != nil { fmt.Fprintln(os.Stderr, "load:", err); os.Exit(2) }
-			} else {
+			case "kernel-fit":
+				if err := st.LoadKernelFIT(p); err != nil { fmt.Fprintln(os.Stderr, "load:", err); os.Exit(2) }
+			case "ext2":
+				if err := st.LoadExt2(p); err != nil { fmt.Fprintln(os.Stderr, "load:", err); os.Exit(2) }
+			default:
 				fmt.Fprintln(os.Stderr, "unknown load type:", typ); os.Exit(2)
 			}
 			loaded = true
@@ -81,21 +93,51 @@ func main() {
 			} else {
 				fmt.Fprintln(os.Stderr, "unknown fs action:", a); os.Exit(2)
 			}
+		case "fit":
+			if i+1 >= len(args) { usage(); os.Exit(1) }
+			a := args[i+1]
+			if a == "ls" {
+				m, _ := st.Meta.(*core.FitMeta)
+				if m == nil || m.F == nil { fmt.Fprintln(os.Stderr, "no FIT loaded"); os.Exit(2) }
+				for _, name := range m.F.List() { fmt.Println(name) }
+				i += 2
+			} else if a == "extract" {
+				if i+3 >= len(args) { usage(); os.Exit(1) }
+				name, out := args[i+2], args[i+3]
+				m, _ := st.Meta.(*core.FitMeta)
+				if m == nil || m.F == nil { fmt.Fprintln(os.Stderr, "no FIT loaded"); os.Exit(2) }
+				img, err := m.F.Get(name); if err != nil { fmt.Fprintln(os.Stderr, err); os.Exit(2) }
+				if err := os.WriteFile(out, img.Data, 0644); err != nil { fmt.Fprintln(os.Stderr, err); os.Exit(2) }
+				i += 4
+			} else {
+				fmt.Fprintln(os.Stderr, "unknown fit action:", a); os.Exit(2)
+			}
 		case "store":
 			if !loaded { fmt.Fprintln(os.Stderr, "nothing loaded to store"); os.Exit(2) }
 			if i+2 >= len(args) { usage(); os.Exit(1) }
 			typ := args[i+1]
-			if typ == "initramfs" {
+			switch typ {
+			case "initramfs":
 				out := args[i+2]
 				comp := "none"
 				if i+3 < len(args) { comp = args[i+3]; i++ }
 				if err := st.StoreInitramfs(out, comp); err != nil { fmt.Fprintln(os.Stderr, "store:", err); os.Exit(2) }
 				i += 3
-			} else if typ == "kernel-legacy" {
+			case "kernel-legacy":
 				out := args[i+2]
 				if err := st.StoreKernelLegacy(out); err != nil { fmt.Fprintln(os.Stderr, "store:", err); os.Exit(2) }
 				i += 3
-			} else {
+			case "kernel-fit":
+				out := args[i+2]
+				if err := st.StoreKernelFIT(out); err != nil { fmt.Fprintln(os.Stderr, "store:", err); os.Exit(2) }
+				i += 3
+			case "ext2":
+				out := args[i+2]
+				bs := 1024
+				if i+3 < len(args) { fmt.Sscanf(args[i+3], "%d", &bs); i++ }
+				if err := st.StoreExt2(out, bs); err != nil { fmt.Fprintln(os.Stderr, "store:", err); os.Exit(2) }
+				i += 3
+			default:
 				fmt.Fprintln(os.Stderr, "unknown store type:", typ); os.Exit(2)
 			}
 		case "info":

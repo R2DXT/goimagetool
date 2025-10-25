@@ -11,8 +11,10 @@ import (
 
 	"goimagetool/internal/compress"
 	"goimagetool/internal/fs/memfs"
+	"goimagetool/internal/fs/ext2"
 	"goimagetool/internal/image/cpio"
 	"goimagetool/internal/image/uboot/legacy"
+	"goimagetool/internal/image/uboot/fit"
 )
 
 type ImageKind int
@@ -20,6 +22,8 @@ const (
 	KindNone ImageKind = iota
 	KindInitramfs
 	KindKernelLegacy
+	KindKernelFIT
+	KindExt2
 )
 
 type State struct {
@@ -83,6 +87,50 @@ func (s *State) StoreKernelLegacy(path string) error {
 	return legacy.Write(f, h, s.Raw)
 }
 
+// FIT/ITB
+type FitMeta struct {
+	F *fit.FIT
+}
+
+func (s *State) LoadKernelFIT(path string) error {
+	f, err := os.Open(path); if err != nil { return err }
+	defer f.Close()
+	F, err := fit.Read(f)
+	if err != nil { return err }
+	s.Kind = KindKernelFIT
+	s.FS = memfs.New()
+	s.Meta = &FitMeta{F: F}
+	s.Raw = nil
+	return nil
+}
+
+func (s *State) StoreKernelFIT(path string) error {
+	f, err := os.Create(path); if err != nil { return err }
+	defer f.Close()
+	m, _ := s.Meta.(*FitMeta)
+	if m == nil || m.F == nil { return errors.New("no FIT meta") }
+	return fit.Write(f, m.F)
+}
+
+// EXT2
+func (s *State) LoadExt2(path string) error {
+	f, err := os.Open(path); if err != nil { return err }
+	defer f.Close()
+	fs, err := ext2.Load(f)
+	if err != nil { return err }
+	s.Kind = KindExt2
+	s.FS = fs
+	s.Meta = nil
+	return nil
+}
+
+func (s *State) StoreExt2(path string, blockSize int) error {
+	f, err := os.Create(path); if err != nil { return err }
+	defer f.Close()
+	return ext2.Store(f, s.FS, blockSize)
+}
+
+// FS helpers
 func (s *State) FSAddLocal(src, dst string) error {
 	dst = filepath.ToSlash(dst)
 	info, err := os.Stat(src)
@@ -124,9 +172,11 @@ func (s *State) Info() string {
 	case KindInitramfs:
 		return "Kind: initramfs (cpio)"
 	case KindKernelLegacy:
-		if h, _ := s.Meta.(*legacy.Header); h != nil {
-			return "Kind: kernel-legacy\n" + h.String()
-		}
+		if h, _ := s.Meta.(*legacy.Header); h != nil { return "Kind: kernel-legacy\n" + h.String() }
+	case KindKernelFIT:
+		if m, _ := s.Meta.(*FitMeta); m != nil { return "Kind: kernel-fit (itb) images=" + fmt.Sprint(m.F.List()) }
+	case KindExt2:
+		return "Kind: ext2"
 	}
 	return "Kind: none"
 }
