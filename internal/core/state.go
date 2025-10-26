@@ -10,11 +10,11 @@ import (
 	"strings"
 
 	"goimagetool/internal/compress"
-	"goimagetool/internal/fs/memfs"
 	"goimagetool/internal/fs/ext2"
+	"goimagetool/internal/fs/memfs"
 	"goimagetool/internal/image/cpio"
-	"goimagetool/internal/image/uboot/legacy"
 	"goimagetool/internal/image/uboot/fit"
+	"goimagetool/internal/image/uboot/legacy"
 )
 
 type ImageKind int
@@ -88,9 +88,7 @@ func (s *State) StoreKernelLegacy(path string) error {
 }
 
 // FIT/ITB
-type FitMeta struct {
-	F *fit.FIT
-}
+type FitMeta struct { F *fit.FIT }
 
 func (s *State) LoadKernelFIT(path string) error {
 	f, err := os.Open(path); if err != nil { return err }
@@ -140,17 +138,22 @@ func (s *State) FSAddLocal(src, dst string) error {
 			if err != nil { return err }
 			rel, _ := filepath.Rel(src, p)
 			out := filepath.ToSlash(filepath.Join(dst, rel))
+			uid, gid := osUIDGID(fi)
 			if fi.IsDir() {
-				s.FS.PutDir(out, 0, 0, fi.ModTime())
+				perm := uint32(fi.Mode().Perm())
+				s.FS.PutDirMode(out, memfs.Mode(0040000|perm), uid, gid, fi.ModTime())
 				return nil
 			}
 			data, err := os.ReadFile(p); if err != nil { return err }
-			s.FS.PutFile(out, data, memfs.Mode(0100644), 0, 0, fi.ModTime())
+			mode := memfs.Mode(0100000 | uint32(fi.Mode().Perm()))
+			s.FS.PutFile(out, data, mode, uid, gid, fi.ModTime())
 			return nil
 		})
 	} else {
 		data, err := os.ReadFile(src); if err != nil { return err }
-		s.FS.PutFile(dst, data, memfs.Mode(0100644), 0, 0, info.ModTime())
+		uid, gid := osUIDGID(info)
+		mode := memfs.Mode(0100000 | uint32(info.Mode().Perm()))
+		s.FS.PutFile(dst, data, mode, uid, gid, info.ModTime())
 		return nil
 	}
 }

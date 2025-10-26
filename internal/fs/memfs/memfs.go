@@ -29,7 +29,7 @@ type FS struct {
 	m map[string]*Entry
 }
 
-func New() *FS { return &FS{m: map[string]*Entry{"/": {Name: "/", Mode: ModeDir}}} }
+func New() *FS { return &FS{m: map[string]*Entry{"/": {Name: "/", Mode: ModeDir | 0o755}}} }
 
 func clean(p string) string {
 	if p == "" { return "/" }
@@ -47,7 +47,7 @@ func (fs *FS) MkdirAll(dir string, uid, gid uint32, mt time.Time) {
 	for _, p := range parts {
 		cur += "/" + p
 		if _, ok := fs.m[cur]; !ok {
-			fs.m[cur] = &Entry{Name: cur, Mode: ModeDir, UID: uid, GID: gid, MTime: mt}
+			fs.m[cur] = &Entry{Name: cur, Mode: ModeDir | 0o755, UID: uid, GID: gid, MTime: mt}
 		}
 	}
 }
@@ -55,13 +55,27 @@ func (fs *FS) MkdirAll(dir string, uid, gid uint32, mt time.Time) {
 func (fs *FS) PutFile(p string, data []byte, mode Mode, uid, gid uint32, mt time.Time) {
 	p = clean(p)
 	fs.MkdirAll(path.Dir(p), uid, gid, mt)
-	fs.m[p] = &Entry{Name: p, Mode: mode|ModeFile, UID: uid, GID: gid, MTime: mt, Data: append([]byte(nil), data...)}
+	// если mode не содержит тип — добавим file
+	if mode&ModeFile == 0 && mode&ModeDir == 0 {
+		mode |= ModeFile
+	}
+	fs.m[p] = &Entry{
+		Name: p, Mode: mode, UID: uid, GID: gid, MTime: mt,
+		Data: append([]byte(nil), data...),
+	}
+}
+
+func (fs *FS) PutDirMode(p string, mode Mode, uid, gid uint32, mt time.Time) {
+	p = clean(p)
+	fs.MkdirAll(p, uid, gid, mt)
+	if mode&ModeDir == 0 {
+		mode |= ModeDir
+	}
+	fs.m[p] = &Entry{Name: p, Mode: mode, UID: uid, GID: gid, MTime: mt}
 }
 
 func (fs *FS) PutDir(p string, uid, gid uint32, mt time.Time) {
-	p = clean(p)
-	fs.MkdirAll(p, uid, gid, mt)
-	fs.m[p] = &Entry{Name: p, Mode: ModeDir, UID: uid, GID: gid, MTime: mt}
+	fs.PutDirMode(p, ModeDir|0o755, uid, gid, mt)
 }
 
 func (fs *FS) Get(p string) (*Entry, bool) {

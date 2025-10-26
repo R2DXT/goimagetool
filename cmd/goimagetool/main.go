@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"goimagetool/internal/core"
+	"goimagetool/internal/image/uboot/fit"
 )
 
 func usage() {
@@ -19,13 +20,17 @@ Usage:
   goimagetool store initramfs <path> [compression]
   goimagetool store kernel-legacy <uImagePath>
   goimagetool store kernel-fit <itbPath>
-  goimagetool store ext2 <imgPath> [blockSize]
+  goimagetool store ext2 <imgPath> [blockSize]         # 1024|2048|4096
 
   goimagetool fs ls [path]
   goimagetool fs add <srcPath> <dstPathInImage>
   goimagetool fs extract <dstDir>
 
+  goimagetool fit new
   goimagetool fit ls
+  goimagetool fit add <name> <file>
+  goimagetool fit rm <name>
+  goimagetool fit set-default <name>
   goimagetool fit extract <imageName> <outPath>
 
   goimagetool info
@@ -46,6 +51,7 @@ func main() {
 		switch args[i] {
 		case "help", "-h", "--help":
 			usage(); return
+
 		case "load":
 			if i+2 >= len(args) { usage(); os.Exit(1) }
 			typ := args[i+1]
@@ -66,6 +72,7 @@ func main() {
 			}
 			loaded = true
 			i += 3
+
 		case "fs":
 			if !loaded { fmt.Fprintln(os.Stderr, "no image loaded; use 'load' first"); os.Exit(2) }
 			if i+1 >= len(args) { usage(); os.Exit(1) }
@@ -73,10 +80,12 @@ func main() {
 			if a == "ls" {
 				p := "/"
 				if i+2 < len(args) { p = args[i+2]; i++ }
+				fmt.Printf("TYPE MODE   UID:GID  SIZE  NAME\n")
 				for _, e := range st.FS.List(p) {
-					t := "file"
-					if e.Mode & 0040000 != 0 { t = "dir" }
-					fmt.Printf("%s\t%s\t%d\n", t, strings.TrimPrefix(e.Name, "/"), len(e.Data))
+					t := "f"
+					if e.Mode & 0040000 != 0 { t = "d" }
+					fmt.Printf("%s    %06o %d:%d %5d %s\n",
+						t, uint32(e.Mode)&0o7777, e.UID, e.GID, len(e.Data), strings.TrimPrefix(e.Name, "/"))
 				}
 				i += 2
 			} else if a == "add" {
@@ -93,15 +102,44 @@ func main() {
 			} else {
 				fmt.Fprintln(os.Stderr, "unknown fs action:", a); os.Exit(2)
 			}
+
 		case "fit":
 			if i+1 >= len(args) { usage(); os.Exit(1) }
 			a := args[i+1]
-			if a == "ls" {
+			switch a {
+			case "new":
+				st.Kind = core.KindKernelFIT
+				st.Meta = &core.FitMeta{F: fit.New()}
+				loaded = true
+				i += 2
+			case "ls":
 				m, _ := st.Meta.(*core.FitMeta)
 				if m == nil || m.F == nil { fmt.Fprintln(os.Stderr, "no FIT loaded"); os.Exit(2) }
 				for _, name := range m.F.List() { fmt.Println(name) }
 				i += 2
-			} else if a == "extract" {
+			case "add":
+				if i+3 >= len(args) { usage(); os.Exit(1) }
+				name, file := args[i+2], args[i+3]
+				m, _ := st.Meta.(*core.FitMeta)
+				if m == nil || m.F == nil { fmt.Fprintln(os.Stderr, "no FIT loaded"); os.Exit(2) }
+				b, err := os.ReadFile(file); if err != nil { fmt.Fprintln(os.Stderr, err); os.Exit(2) }
+				m.F.Add(name, b, "sha1")
+				i += 4
+			case "rm":
+				if i+2 >= len(args) { usage(); os.Exit(1) }
+				name := args[i+2]
+				m, _ := st.Meta.(*core.FitMeta)
+				if m == nil || m.F == nil { fmt.Fprintln(os.Stderr, "no FIT loaded"); os.Exit(2) }
+				m.F.Remove(name)
+				i += 3
+			case "set-default":
+				if i+2 >= len(args) { usage(); os.Exit(1) }
+				name := args[i+2]
+				m, _ := st.Meta.(*core.FitMeta)
+				if m == nil || m.F == nil { fmt.Fprintln(os.Stderr, "no FIT loaded"); os.Exit(2) }
+				m.F.SetDefault(name)
+				i += 3
+			case "extract":
 				if i+3 >= len(args) { usage(); os.Exit(1) }
 				name, out := args[i+2], args[i+3]
 				m, _ := st.Meta.(*core.FitMeta)
@@ -109,9 +147,10 @@ func main() {
 				img, err := m.F.Get(name); if err != nil { fmt.Fprintln(os.Stderr, err); os.Exit(2) }
 				if err := os.WriteFile(out, img.Data, 0644); err != nil { fmt.Fprintln(os.Stderr, err); os.Exit(2) }
 				i += 4
-			} else {
+			default:
 				fmt.Fprintln(os.Stderr, "unknown fit action:", a); os.Exit(2)
 			}
+
 		case "store":
 			if !loaded { fmt.Fprintln(os.Stderr, "nothing loaded to store"); os.Exit(2) }
 			if i+2 >= len(args) { usage(); os.Exit(1) }
@@ -140,9 +179,11 @@ func main() {
 			default:
 				fmt.Fprintln(os.Stderr, "unknown store type:", typ); os.Exit(2)
 			}
+
 		case "info":
 			fmt.Println(st.Info())
 			i++
+
 		default:
 			usage(); os.Exit(1)
 		}

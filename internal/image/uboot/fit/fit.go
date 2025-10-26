@@ -16,9 +16,11 @@ type Image struct {
 }
 
 type FIT struct {
-	Images map[string]*Image
+	Images        map[string]*Image
 	DefaultConfig string
 }
+
+func New() *FIT { return &FIT{Images: map[string]*Image{}} }
 
 func Read(r io.Reader) (*FIT, error) {
 	all, err := io.ReadAll(r)
@@ -86,4 +88,32 @@ func (f *FIT) List() []string {
 func (f *FIT) Get(name string) (*Image, error) {
 	if v, ok := f.Images[name]; ok { return v, nil }
 	return nil, errors.New("image not found")
+}
+
+func (f *FIT) Add(name string, data []byte, algo string) {
+	if algo == "" { algo = "sha1" }
+	sum := sha1.Sum(data)
+	f.Images[name] = &Image{
+		Name: name,
+		Data: append([]byte(nil), data...),
+		Algo: algo,
+		Hash: hex.EncodeToString(sum[:]),
+	}
+	if f.DefaultConfig == "" {
+		f.DefaultConfig = name
+	}
+}
+
+func (f *FIT) Remove(name string) {
+	delete(f.Images, name)
+	if f.DefaultConfig == name {
+		f.DefaultConfig = ""
+		for k := range f.Images { f.DefaultConfig = k; break }
+	}
+}
+
+func (f *FIT) SetDefault(name string) {
+	if _, ok := f.Images[name]; ok {
+		f.DefaultConfig = name
+	}
 }
