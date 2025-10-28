@@ -12,17 +12,26 @@ import (
 
 type Mode uint32
 
+// POSIX type bits (match ext2 & unix)
 const (
-	ModeFile Mode = 0100000
-	ModeDir  Mode = 0040000
+	ModeFIFO  Mode = 0010000
+	ModeChar  Mode = 0020000
+	ModeDir   Mode = 0040000
+	ModeBlock Mode = 0060000
+	ModeFile  Mode = 0100000
+	ModeLink  Mode = 0120000
+	// perms come in lower 9 bits, e.g. 0755, 0644, etc.
 )
 
 type Entry struct {
-	Name string
-	Mode Mode
-	UID, GID uint32
-	MTime time.Time
-	Data []byte // for files only
+	Name        string
+	Mode        Mode
+	UID, GID    uint32
+	MTime       time.Time
+	Data        []byte // for regular files
+	Target      string // for symlinks
+	RdevMajor   uint32 // for char/block
+	RdevMinor   uint32 // for char/block
 }
 
 type FS struct {
@@ -55,8 +64,7 @@ func (fs *FS) MkdirAll(dir string, uid, gid uint32, mt time.Time) {
 func (fs *FS) PutFile(p string, data []byte, mode Mode, uid, gid uint32, mt time.Time) {
 	p = clean(p)
 	fs.MkdirAll(path.Dir(p), uid, gid, mt)
-	// если mode не содержит тип — добавим file
-	if mode&ModeFile == 0 && mode&ModeDir == 0 {
+	if mode&ModeFile == 0 && mode&ModeDir == 0 && mode&ModeLink == 0 {
 		mode |= ModeFile
 	}
 	fs.m[p] = &Entry{
@@ -76,6 +84,19 @@ func (fs *FS) PutDirMode(p string, mode Mode, uid, gid uint32, mt time.Time) {
 
 func (fs *FS) PutDir(p string, uid, gid uint32, mt time.Time) {
 	fs.PutDirMode(p, ModeDir|0o755, uid, gid, mt)
+}
+
+func (fs *FS) PutSymlink(dst, target string, uid, gid uint32, mt time.Time) {
+	dst = clean(dst)
+	fs.MkdirAll(path.Dir(dst), uid, gid, mt)
+	fs.m[dst] = &Entry{Name: dst, Mode: ModeLink | 0o777, UID: uid, GID: gid, MTime: mt, Target: target}
+}
+
+func (fs *FS) PutNode(dst string, typ Mode, perm uint32, uid, gid, major, minor uint32, mt time.Time) {
+	dst = clean(dst)
+	fs.MkdirAll(path.Dir(dst), uid, gid, mt)
+	mode := typ | Mode(perm&0o7777)
+	fs.m[dst] = &Entry{Name: dst, Mode: mode, UID: uid, GID: gid, MTime: mt, RdevMajor: major, RdevMinor: minor}
 }
 
 func (fs *FS) Get(p string) (*Entry, bool) {

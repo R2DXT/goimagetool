@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"goimagetool/internal/compress"
 	"goimagetool/internal/fs/ext2"
@@ -131,17 +132,47 @@ func (s *State) StoreExt2(path string, blockSize int) error {
 // FS helpers
 func (s *State) FSAddLocal(src, dst string) error {
 	dst = filepath.ToSlash(dst)
-	info, err := os.Stat(src)
+	info, err := os.Lstat(src)
 	if err != nil { return err }
+	if info.Mode()&os.ModeSymlink != 0 {
+		t, err := os.Readlink(src); if err != nil { return err }
+		uid, gid := osUIDGID(info)
+		s.FS.PutSymlink(dst, t, uid, gid, info.ModTime())
+		return nil
+	}
 	if info.IsDir() {
 		return filepath.Walk(src, func(p string, fi os.FileInfo, err error) error {
 			if err != nil { return err }
 			rel, _ := filepath.Rel(src, p)
 			out := filepath.ToSlash(filepath.Join(dst, rel))
 			uid, gid := osUIDGID(fi)
+			if fi.Mode()&os.ModeSymlink != 0 {
+				t, err := os.Readlink(p); if err != nil { return err }
+				s.FS.PutSymlink(out, t, uid, gid, fi.ModTime())
+				return nil
+			}
 			if fi.IsDir() {
 				perm := uint32(fi.Mode().Perm())
 				s.FS.PutDirMode(out, memfs.Mode(0040000|perm), uid, gid, fi.ModTime())
+				return nil
+			}
+			// device nodes / fifo if possible
+			if (fi.Mode() & os.ModeDevice) != 0 || (fi.Mode() & os.ModeNamedPipe) != 0 {
+				var maj, min uint32
+				if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+					maj = uint32((st.Rdev >> 8) & 0xff)
+					min = uint32(st.Rdev & 0xff)
+				}
+				perm := uint32(fi.Mode().Perm())
+				var typ memfs.Mode
+				if (fi.Mode() & os.ModeCharDevice) != 0 {
+					typ = memfs.ModeChar
+				} else if (fi.Mode() & os.ModeDevice) != 0 {
+					typ = memfs.ModeBlock
+				} else {
+					typ = memfs.ModeFIFO
+				}
+				s.FS.PutNode(out, typ, perm, uid, gid, maj, min, fi.ModTime())
 				return nil
 			}
 			data, err := os.ReadFile(p); if err != nil { return err }
@@ -150,8 +181,26 @@ func (s *State) FSAddLocal(src, dst string) error {
 			return nil
 		})
 	} else {
-		data, err := os.ReadFile(src); if err != nil { return err }
 		uid, gid := osUIDGID(info)
+		if info.Mode()&os.ModeNamedPipe != 0 || info.Mode()&os.ModeDevice != 0 {
+			perm := uint32(info.Mode().Perm())
+			var typ memfs.Mode
+			if (info.Mode() & os.ModeCharDevice) != 0 {
+				typ = memfs.ModeChar
+			} else if (info.Mode() & os.ModeDevice) != 0 {
+				typ = memfs.ModeBlock
+			} else {
+				typ = memfs.ModeFIFO
+			}
+			s.FS.PutNode(dst, typ, perm, uid, gid, 0, 0, info.ModTime())
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			t, err := os.Readlink(src); if err != nil { return err }
+			s.FS.PutSymlink(dst, t, uid, gid, info.ModTime())
+			return nil
+		}
+		data, err := os.ReadFile(src); if err != nil { return err }
 		mode := memfs.Mode(0100000 | uint32(info.Mode().Perm()))
 		s.FS.PutFile(dst, data, mode, uid, gid, info.ModTime())
 		return nil
@@ -166,7 +215,19 @@ func (s *State) FSExtract(dst string) error {
 			return os.MkdirAll(out, 0755)
 		}
 		if err := os.MkdirAll(filepath.Dir(out), 0755); err != nil { return err }
-		return os.WriteFile(out, e.Data, 0644)
+		switch {
+		case e.Mode & memfs.ModeLink != 0:
+			_ = os.Remove(out)
+			return os.Symlink(e.Target, out)
+		case e.Mode & memfs.ModeChar != 0:
+			return mknodSpecial(out, uint32(e.Mode), e.RdevMajor, e.RdevMinor)
+		case e.Mode & memfs.ModeBlock != 0:
+			return mknodSpecial(out, uint32(e.Mode), e.RdevMajor, e.RdevMinor)
+		case e.Mode & memfs.ModeFIFO != 0:
+			return mknodSpecial(out, uint32(e.Mode), 0, 0)
+		default:
+			return os.WriteFile(out, e.Data, 0644)
+		}
 	})
 }
 

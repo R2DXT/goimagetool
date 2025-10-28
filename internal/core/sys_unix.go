@@ -13,3 +13,10 @@ func osUIDGID(fi os.FileInfo) (uint32, uint32) {
 	}
 	return 0, 0
 }
+
+// mknod for char/block/fifo
+func mknodSpecial(path string, mode uint32, major, minor uint32) error {
+	// simple old-style makedev; works for many cases
+	dev := int((major << 8) | (minor & 0xff))
+	return syscall.Mknod(path, mode, dev)
+}
