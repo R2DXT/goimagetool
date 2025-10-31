@@ -1,5 +1,5 @@
 # Go
 /goimagetool
+/fit.json
 *.exe
 *.test
-*.out
