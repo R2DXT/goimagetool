@@ -124,3 +124,7 @@ Replace ramdisk in a FIT image:
 ```bash
 GOIMAGETOOL_SESSION=/tmp/gt.session ./goimagetool load kernel-fit artifacts/kernel.itb auto   fit add ramdisk dist/initramfs.patched.cpio.gz   store kernel-fit dist/kernel.patched.itb none
 ```
+
+./goimagetool fm 
+<img width="1734" height="816" alt="image" src="https://github.com/user-attachments/assets/78a1a5bb-3bee-4fba-9e89-09f472c8813d" />
+
