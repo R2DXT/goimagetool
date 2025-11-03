@@ -1,119 +1,164 @@
 package fit
 
 import (
-	"bytes"
 	"crypto/sha1"
-	"encoding/hex"
+	"crypto/sha256"
+	"crypto/sha512"
 	"errors"
-	"io"
+	"sort"
+	"strings"
 )
 
 type Image struct {
-	Name string
-	Data []byte
-	Algo string // e.g., "sha1"
-	Hash string // hex
+	Name     string
+	Type     string // kernel|fdt|ramdisk|custom
+	Data     []byte
+	HashAlgo string // sha1|sha256|sha512
+	Digest   []byte
 }
 
-type FIT struct {
-	Images        map[string]*Image
-	DefaultConfig string
+type Fit struct {
+	imgs    map[string]*Image
+	Default string
 }
 
-func New() *FIT { return &FIT{Images: map[string]*Image{}} }
+// Старое имя, которого ждёт core.
+type FIT = Fit
 
-func Read(r io.Reader) (*FIT, error) {
-	all, err := io.ReadAll(r)
-	if err != nil { return nil, err }
-	root, err := parseFDT(all)
-	if err != nil { return nil, err }
-	f := &FIT{Images: map[string]*Image{}}
-	var imagesNode, confNode *Node
-	for _, ch := range root.Children {
-		if ch.Name == "images" { imagesNode = ch }
-		if ch.Name == "configurations" { confNode = ch }
+func New() *Fit { return &Fit{imgs: make(map[string]*Image)} }
+
+func normAlgo(a string) string {
+	switch strings.ToLower(a) {
+	case "sha256", "sha-256":
+		return "sha256"
+	case "sha512", "sha-512":
+		return "sha512"
+	default:
+		return "sha1"
 	}
-	if imagesNode != nil {
-		for _, img := range imagesNode.Children {
-			data := img.Props["data"]
-			algo := string(img.Props["algo"])
-			hash := string(img.Props["hash"])
-			name := img.Name
-			f.Images[name] = &Image{Name: name, Data: append([]byte(nil), data...), Algo: algo, Hash: hash}
-		}
-	}
-	if confNode != nil {
-		if d, ok := confNode.Props["default"]; ok {
-			f.DefaultConfig = string(d)
-		}
-	}
-	return f, nil
 }
 
-func Write(w io.Writer, f *FIT) error {
-	root := &Node{Name: "", Props: map[string][]byte{}}
-	images := &Node{Name: "images", Props: map[string][]byte{}}
-	root.Children = append(root.Children, images)
-	configs := &Node{Name: "configurations", Props: map[string][]byte{}}
-	if f.DefaultConfig != "" { configs.Props["default"] = []byte(f.DefaultConfig) }
-	root.Children = append(root.Children, configs)
-	for name, im := range f.Images {
-		n := &Node{Name: name, Props: map[string][]byte{}}
-		n.Props["data"] = append([]byte(nil), im.Data...)
-		if im.Algo == "" { im.Algo = "sha1" }
-		n.Props["algo"] = []byte(im.Algo)
-		if im.Hash == "" {
-			s := sha1.Sum(im.Data)
-			im.Hash = hex.EncodeToString(s[:])
-		}
-		n.Props["hash"] = []byte(im.Hash)
-		images.Children = append(images.Children, n)
+func hashData(algo string, b []byte) []byte {
+	switch algo {
+	case "sha256":
+		h := sha256.Sum256(b)
+		return h[:]
+	case "sha512":
+		h := sha512.Sum512(b)
+		return h[:]
+	default:
+		h := sha1.Sum(b)
+		return h[:]
 	}
-	if f.DefaultConfig == "" && len(f.Images) > 0 {
-		for k := range f.Images { f.DefaultConfig = k; break }
-		configs.Props["default"] = []byte(f.DefaultConfig)
-	}
-	b, err := buildFDT(root)
-	if err != nil { return err }
-	_, err = io.Copy(w, bytes.NewReader(b))
-	return err
 }
 
-func (f *FIT) List() []string {
-	out := make([]string, 0, len(f.Images))
-	for k := range f.Images { out = append(out, k) }
+func (f *Fit) Add(name string, data []byte, algo string) { _ = f.AddTyped(name, data, algo, "") }
+
+func (f *Fit) AddTyped(name string, data []byte, algo, typ string) error {
+	if name == "" {
+		return errors.New("fit: empty name")
+	}
+	if f.imgs == nil {
+		f.imgs = make(map[string]*Image)
+	}
+	a := normAlgo(algo)
+	img := &Image{
+		Name:     name,
+		Type:     strings.ToLower(typ),
+		Data:     append([]byte(nil), data...),
+		HashAlgo: a,
+		Digest:   hashData(a, data),
+	}
+	f.imgs[name] = img
+	if f.Default == "" {
+		f.Default = name
+	}
+	return nil
+}
+
+func (f *Fit) Remove(name string) {
+	if f == nil || f.imgs == nil {
+		return
+	}
+	delete(f.imgs, name)
+	if f.Default == name {
+		f.Default = ""
+	}
+}
+
+func (f *Fit) SetDefault(name string) {
+	if f == nil || f.imgs == nil {
+		return
+	}
+	if _, ok := f.imgs[name]; ok {
+		f.Default = name
+	}
+}
+
+func (f *Fit) List() []string {
+	if f == nil || f.imgs == nil {
+		return nil
+	}
+	out := make([]string, 0, len(f.imgs))
+	for k := range f.imgs {
+		out = append(out, k)
+	}
+	sort.Strings(out)
 	return out
 }
 
-func (f *FIT) Get(name string) (*Image, error) {
-	if v, ok := f.Images[name]; ok { return v, nil }
-	return nil, errors.New("image not found")
+func (f *Fit) Get(name string) (*Image, error) {
+	if f == nil || f.imgs == nil {
+		return nil, errors.New("fit: empty")
+	}
+	img, ok := f.imgs[name]
+	if !ok {
+		return nil, errors.New("fit: not found")
+	}
+	return img, nil
 }
 
-func (f *FIT) Add(name string, data []byte, algo string) {
-	if algo == "" { algo = "sha1" }
-	sum := sha1.Sum(data)
-	f.Images[name] = &Image{
-		Name: name,
-		Data: append([]byte(nil), data...),
-		Algo: algo,
-		Hash: hex.EncodeToString(sum[:]),
+func (f *Fit) Verify() error {
+	if f == nil || f.imgs == nil {
+		return errors.New("fit: empty")
 	}
-	if f.DefaultConfig == "" {
-		f.DefaultConfig = name
+	for _, img := range f.imgs {
+		if img == nil {
+			continue
+		}
+		got := hashData(img.HashAlgo, img.Data)
+		if len(img.Digest) == 0 {
+			img.Digest = got
+			continue
+		}
+		if !equalBytes(got, img.Digest) {
+			return errors.New("fit: verify failed: " + img.Name)
+		}
 	}
+	return nil
 }
 
-func (f *FIT) Remove(name string) {
-	delete(f.Images, name)
-	if f.DefaultConfig == name {
-		f.DefaultConfig = ""
-		for k := range f.Images { f.DefaultConfig = k; break }
+// VerifyOne — то же самое, но для одного образа; если digest пуст — заполняем им.
+func (f *Fit) VerifyOne(name string) (bool, error) {
+	img, err := f.Get(name)
+	if err != nil {
+		return false, err
 	}
+	got := hashData(img.HashAlgo, img.Data)
+	if len(img.Digest) == 0 {
+		img.Digest = got
+		return true, nil
+	}
+	return equalBytes(got, img.Digest), nil
 }
 
-func (f *FIT) SetDefault(name string) {
-	if _, ok := f.Images[name]; ok {
-		f.DefaultConfig = name
+func equalBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
 	}
+	var v byte
+	for i := range a {
+		v |= a[i] ^ b[i]
+	}
+	return v == 0
 }

@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha1"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,44 +13,43 @@ import (
 	"goimagetool/internal/core"
 	"goimagetool/internal/fs/memfs"
 	"goimagetool/internal/image/uboot/fit"
+	fmui "goimagetool/internal/tui/fm"
 )
 
 func usage() {
 	fmt.Println(`goimagetool - unified image tool (Go)
 Usage:
-  goimagetool [--session <path>] <commands...>
+  goimagetool [--session <path|auto>] <commands...>
 
-  goimagetool load initramfs <path> [compression]        # compression: auto|none|gzip|zstd|lz4|lzma|bzip2|xz
+  goimagetool load auto <path>
+  goimagetool load initramfs <path> [compression]        # auto|none|gzip|zstd|lz4|lzma|bzip2|xz
   goimagetool load kernel-legacy <uImagePath>
   goimagetool load kernel-fit <itbPath> [compression]
   goimagetool load squashfs <imgPath> [compression]
   goimagetool load ext2 <imgPath> [compression]
+  goimagetool load tar <path> [compression]              # auto|none|gzip (RO)
 
   goimagetool store initramfs <path> [compression]
   goimagetool store kernel-legacy <uImagePath>
   goimagetool store kernel-fit <itbPath> [compression]
   goimagetool store squashfs <imgPath> [compression]          # gzip|xz|zstd|lz4|lzo|lzma
-  goimagetool store ext2 <imgPath> [blockSize] [compression]  # 1024|2048|4096; compression optional
+  goimagetool store ext2 <imgPath> [blockSize] [compression]  # 1024|2048|4096
+  goimagetool store tar <path> [compression]                  # none|gzip
 
-  goimagetool fs ls [-L] [path]            # -L follow symlinks if 'path' is a symlink
+  goimagetool fs ls [-L] [path]
   goimagetool fs add <srcPath> <dstPathInImage>
   goimagetool fs extract <dstDir>
   goimagetool fs ln -s <target> <dstPathInImage>
   goimagetool fs mknod <c|b|p> <major> <minor> <dstPathInImage>
 
-  goimagetool fit new
-  goimagetool fit ls
-  goimagetool fit add <name> <file>
-  goimagetool fit rm <name>
-  goimagetool fit set-default <name>
-  goimagetool fit extract <imageName> <outPath>
+  goimagetool fit new|ls|add|rm|set-default|extract|verify ...
+  goimagetool fm [hostStartDir]
 
-  goimagetool session save [path]
-  goimagetool session load [path]
-  goimagetool session clear
+  goimagetool image resize <path> (+SIZE|-SIZE|--to SIZE[K|M|G])
+  goimagetool image pad    <path> --align SIZE[K|M|G]
 
-  goimagetool info
-  goimagetool help
+  goimagetool session save [path] | load [path] | clear
+  goimagetool info | help
 `)
 }
 
@@ -56,6 +59,17 @@ func defaultSessionPath() string {
 		return "session.json"
 	}
 	return filepath.Join(home, ".cache", "goimagetool", "session.json")
+}
+
+func defaultSessionPathAuto() string {
+	base := os.Getenv("XDG_RUNTIME_DIR")
+	if base == "" {
+		base = "/tmp"
+	}
+	wd, _ := os.Getwd()
+	h := sha1.Sum([]byte(wd))
+	name := fmt.Sprintf("%x.session", h[:6])
+	return filepath.Join(base, "goimagetool", name)
 }
 
 func isDigits(s string) bool {
@@ -70,6 +84,98 @@ func isDigits(s string) bool {
 	return true
 }
 
+type autoDetect struct {
+	typ  string
+	comp string
+}
+
+func detectImageType(path string) (autoDetect, error) {
+	var r autoDetect
+	f, err := os.Open(path)
+	if err != nil {
+		return r, err
+	}
+	defer f.Close()
+
+	head := make([]byte, 4096)
+	n, _ := io.ReadFull(f, head)
+	head = head[:n]
+
+	ext := strings.ToLower(filepath.Ext(path))
+
+	if n >= 4 {
+		be := binary.BigEndian.Uint32(head[:4])
+		le := binary.LittleEndian.Uint32(head[:4])
+		switch be {
+		case 0x27051956:
+			return autoDetect{typ: "kernel-legacy", comp: "auto"}, nil
+		case 0xd00dfeed:
+			return autoDetect{typ: "kernel-fit", comp: "auto"}, nil
+		}
+		switch le {
+		case 0x73717368:
+			return autoDetect{typ: "squashfs", comp: "auto"}, nil
+		}
+	}
+	if n >= 262 && bytes.Equal(head[257:257+5], []byte("ustar")) {
+		return autoDetect{typ: "tar", comp: "none"}, nil
+	}
+	if n >= 6 && bytes.Equal(head[:6], []byte("070701")) {
+		return autoDetect{typ: "initramfs", comp: "none"}, nil
+	}
+	if n >= 2 && head[0] == 0x1f && head[1] == 0x8b {
+		if strings.HasSuffix(strings.ToLower(path), ".tar.gz") || strings.HasSuffix(strings.ToLower(path), ".tgz") {
+			return autoDetect{typ: "tar", comp: "gzip"}, nil
+		}
+		return autoDetect{typ: "initramfs", comp: "auto"}, nil
+	}
+	if n >= 6 && bytes.Equal(head[:6], []byte{0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00}) {
+		return autoDetect{typ: "initramfs", comp: "auto"}, nil
+	}
+	if n >= 4 && bytes.Equal(head[:4], []byte{0x28, 0xb5, 0x2f, 0xfd}) {
+		return autoDetect{typ: "initramfs", comp: "auto"}, nil
+	}
+	if n >= 4 && bytes.Equal(head[:4], []byte{0x04, 0x22, 0x4d, 0x18}) {
+		return autoDetect{typ: "initramfs", comp: "auto"}, nil
+	}
+	if n >= 3 && bytes.Equal(head[:3], []byte("BZh")) {
+		return autoDetect{typ: "initramfs", comp: "auto"}, nil
+	}
+	if n >= 5 && bytes.Equal(head[:5], []byte{0xfd, 0x37, 0x7a, 0x58, 0x00}) {
+		return autoDetect{typ: "initramfs", comp: "auto"}, nil
+	}
+
+	switch ext {
+	case ".itb":
+		return autoDetect{typ: "kernel-fit", comp: "auto"}, nil
+	case ".uimage":
+		return autoDetect{typ: "kernel-legacy", comp: "auto"}, nil
+	case ".tar":
+		return autoDetect{typ: "tar", comp: "none"}, nil
+	case ".tgz":
+		return autoDetect{typ: "tar", comp: "gzip"}, nil
+	case ".gz":
+		if strings.HasSuffix(strings.ToLower(path), ".tar.gz") {
+			return autoDetect{typ: "tar", comp: "gzip"}, nil
+		}
+		return autoDetect{typ: "initramfs", comp: "auto"}, nil
+	case ".cpio", ".cpio.gz", ".cpio.zst", ".cpio.xz", ".cpio.lz4", ".cpio.bz2", ".cpio.lzma", ".zst", ".xz", ".lz4", ".bz2", ".lzma":
+		return autoDetect{typ: "initramfs", comp: "auto"}, nil
+	case ".sqsh", ".squashfs":
+		return autoDetect{typ: "squashfs", comp: "auto"}, nil
+	case ".ext2", ".img":
+		buf := make([]byte, 2)
+		if _, err := f.Seek(1024+56, io.SeekStart); err == nil {
+			if _, err := io.ReadFull(f, buf); err == nil {
+				if binary.LittleEndian.Uint16(buf) == 0xEF53 {
+					return autoDetect{typ: "ext2", comp: "none"}, nil
+				}
+			}
+		}
+	}
+	return autoDetect{typ: "initramfs", comp: "auto"}, nil
+}
+
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
@@ -78,11 +184,18 @@ func main() {
 	}
 
 	var sessionPath string
+	if env := os.Getenv("GOIMAGETOOL_SESSION"); env != "" {
+		sessionPath = env
+	}
 	if len(args) >= 1 && args[0] == "--session" {
-		if len(args) >= 2 && !strings.HasPrefix(args[1], "-") {
+		switch {
+		case len(args) >= 2 && args[1] == "auto":
+			sessionPath = defaultSessionPathAuto()
+			args = args[2:]
+		case len(args) >= 2 && !strings.HasPrefix(args[1], "-"):
 			sessionPath = args[1]
 			args = args[2:]
-		} else {
+		default:
 			sessionPath = defaultSessionPath()
 			args = args[1:]
 		}
@@ -94,6 +207,9 @@ func main() {
 	if sessionPath != "" {
 		if err := st.LoadSession(sessionPath); err == nil {
 			loaded = true
+		}
+		if dir := filepath.Dir(sessionPath); dir != "" {
+			_ = os.MkdirAll(dir, 0o755)
 		}
 	}
 
@@ -149,50 +265,103 @@ func main() {
 				os.Exit(2)
 			}
 
+		case "fm":
+			start := ""
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				start = args[i+1]
+				i++
+			}
+			if err := fmui.Run(st, start); err != nil {
+				fmt.Fprintln(os.Stderr, "fm:", err)
+				os.Exit(2)
+			}
+			i++
+
 		case "load":
 			if i+2 >= len(args) {
 				usage()
 				os.Exit(1)
 			}
 			typ := args[i+1]
-			p := args[i+2]
-			comp := "auto"
-			if (typ == "initramfs" || typ == "kernel-fit" || typ == "ext2" || typ == "squashfs") && i+3 < len(args) {
-				comp = args[i+3]
-				i++
-			}
 			switch typ {
-			case "initramfs":
-				if err := st.LoadInitramfs(p, comp); err != nil {
+			case "auto":
+				p := args[i+2]
+				ad, err := detectImageType(p)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "auto:", err)
+					os.Exit(2)
+				}
+				switch ad.typ {
+				case "initramfs":
+					if err := st.LoadInitramfs(p, ad.comp); err != nil {
+						fmt.Fprintln(os.Stderr, "load:", err)
+						os.Exit(2)
+					}
+				case "kernel-legacy":
+					if err := st.LoadKernelLegacy(p); err != nil {
+						fmt.Fprintln(os.Stderr, "load:", err)
+						os.Exit(2)
+					}
+				case "kernel-fit":
+					if err := st.LoadKernelFIT(p, ad.comp); err != nil {
+						fmt.Fprintln(os.Stderr, "load:", err)
+						os.Exit(2)
+					}
+				case "squashfs":
+					if err := st.LoadSquashFS(p, ad.comp); err != nil {
+						fmt.Fprintln(os.Stderr, "load:", err)
+						os.Exit(2)
+					}
+				case "ext2":
+					if err := st.LoadExt2(p, ad.comp); err != nil {
+						fmt.Fprintln(os.Stderr, "load:", err)
+						os.Exit(2)
+					}
+				case "tar":
+					if err := st.LoadTar(p, ad.comp); err != nil {
+						fmt.Fprintln(os.Stderr, "load:", err)
+						os.Exit(2)
+					}
+				default:
+					fmt.Fprintln(os.Stderr, "auto: unknown type")
+					os.Exit(2)
+				}
+				loaded = true
+				i += 3
+
+			case "initramfs", "kernel-legacy", "kernel-fit", "squashfs", "ext2", "tar":
+				p := args[i+2]
+				comp := "auto"
+				if (typ == "initramfs" || typ == "kernel-fit" || typ == "ext2" || typ == "squashfs" || typ == "tar") && i+3 < len(args) {
+					comp = args[i+3]
+					i++
+				}
+				var err error
+				switch typ {
+				case "initramfs":
+					err = st.LoadInitramfs(p, comp)
+				case "kernel-legacy":
+					err = st.LoadKernelLegacy(p)
+				case "kernel-fit":
+					err = st.LoadKernelFIT(p, comp)
+				case "squashfs":
+					err = st.LoadSquashFS(p, comp)
+				case "ext2":
+					err = st.LoadExt2(p, comp)
+				case "tar":
+					err = st.LoadTar(p, comp)
+				}
+				if err != nil {
 					fmt.Fprintln(os.Stderr, "load:", err)
 					os.Exit(2)
 				}
-			case "kernel-legacy":
-				if err := st.LoadKernelLegacy(p); err != nil {
-					fmt.Fprintln(os.Stderr, "load:", err)
-					os.Exit(2)
-				}
-			case "kernel-fit":
-				if err := st.LoadKernelFIT(p, comp); err != nil {
-					fmt.Fprintln(os.Stderr, "load:", err)
-					os.Exit(2)
-				}
-			case "squashfs":
-				if err := st.LoadSquashFS(p, comp); err != nil {
-					fmt.Fprintln(os.Stderr, "load:", err)
-					os.Exit(2)
-				}
-			case "ext2":
-				if err := st.LoadExt2(p, comp); err != nil {
-					fmt.Fprintln(os.Stderr, "load:", err)
-					os.Exit(2)
-				}
+				loaded = true
+				i += 3
+
 			default:
 				fmt.Fprintln(os.Stderr, "unknown load type:", typ)
 				os.Exit(2)
 			}
-			loaded = true
-			i += 3
 
 		case "fs":
 			if !loaded {
@@ -206,7 +375,6 @@ func main() {
 			a := args[i+1]
 			switch a {
 			case "ls":
-				// fs ls [-L] [path]
 				p := "/"
 				follow := false
 				consumed := 2
@@ -223,7 +391,6 @@ func main() {
 				resolved, ent := resolvePathFollow(st.FS, p, follow)
 				fmt.Printf("TYPE MODE    UID:GID  SIZE  NAME\n")
 				if ent == nil {
-					// нет такого пути — пробуем показать как есть (пусто)
 					i += consumed
 					break
 				}
@@ -247,6 +414,7 @@ func main() {
 					os.Exit(2)
 				}
 				i += 4
+
 			case "extract":
 				if i+2 >= len(args) {
 					usage()
@@ -262,6 +430,7 @@ func main() {
 					os.Exit(2)
 				}
 				i += 3
+
 			case "ln":
 				if i+4 >= len(args) || args[i+2] != "-s" {
 					usage()
@@ -270,6 +439,7 @@ func main() {
 				target, dst := args[i+3], args[i+4]
 				st.FS.PutSymlink(dst, target, 0, 0, st.FS.Snapshot()["/"].MTime)
 				i += 5
+
 			case "mknod":
 				if i+6 >= len(args) {
 					usage()
@@ -300,6 +470,7 @@ func main() {
 				}
 				st.FS.PutNode(dst, mode, 0o666, 0, 0, uint32(maj), uint32(min), st.FS.Snapshot()["/"].MTime)
 				i += 6
+
 			default:
 				fmt.Fprintln(os.Stderr, "unknown fs action:", a)
 				os.Exit(2)
@@ -317,6 +488,7 @@ func main() {
 				st.Meta = &core.FitMeta{F: fit.New()}
 				loaded = true
 				i += 2
+
 			case "ls":
 				m, _ := st.Meta.(*core.FitMeta)
 				if m == nil || m.F == nil {
@@ -324,27 +496,67 @@ func main() {
 					os.Exit(2)
 				}
 				for _, name := range m.F.List() {
-					fmt.Println(name)
+					mark := ""
+					if m.F.Default == name {
+						mark = " *"
+					}
+					img, _ := m.F.Get(name)
+					typ := img.Type
+					if typ == "" {
+						typ = "blob"
+					}
+					fmt.Printf("%s%s (%s, %s)\n", name, mark, typ, img.HashAlgo)
 				}
 				i += 2
+
 			case "add":
-				if i+3 >= len(args) {
-					usage()
-					os.Exit(1)
-				}
-				name, file := args[i+2], args[i+3]
 				m, _ := st.Meta.(*core.FitMeta)
 				if m == nil || m.F == nil {
 					fmt.Fprintln(os.Stderr, "no FIT loaded")
 					os.Exit(2)
 				}
+				j := i + 2
+				setType := ""
+				setHash := "sha1"
+				for j < len(args) && strings.HasPrefix(args[j], "-") {
+					switch args[j] {
+					case "--type", "-t":
+						if j+1 >= len(args) {
+							fmt.Fprintln(os.Stderr, "fit add: missing value for --type")
+							os.Exit(2)
+						}
+						setType = args[j+1]
+						j += 2
+						continue
+					case "--hash", "-H":
+						if j+1 >= len(args) {
+							fmt.Fprintln(os.Stderr, "fit add: missing value for --hash")
+							os.Exit(2)
+						}
+						setHash = args[j+1]
+						j += 2
+						continue
+					default:
+						fmt.Fprintln(os.Stderr, "fit add: unknown flag", args[j])
+						os.Exit(2)
+					}
+				}
+				if j+1 >= len(args) {
+					usage()
+					os.Exit(1)
+				}
+				name, file := args[j], args[j+1]
 				b, err := os.ReadFile(file)
 				if err != nil {
 					fmt.Fprintln(os.Stderr, err)
 					os.Exit(2)
 				}
-				m.F.Add(name, b, "sha1")
-				i += 4
+				if err := m.F.AddTyped(name, b, setHash, setType); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(2)
+				}
+				i = j + 2
+
 			case "rm":
 				if i+2 >= len(args) {
 					usage()
@@ -358,6 +570,7 @@ func main() {
 				}
 				m.F.Remove(name)
 				i += 3
+
 			case "set-default":
 				if i+2 >= len(args) {
 					usage()
@@ -371,6 +584,7 @@ func main() {
 				}
 				m.F.SetDefault(name)
 				i += 3
+
 			case "extract":
 				if i+3 >= len(args) {
 					usage()
@@ -392,8 +606,126 @@ func main() {
 					os.Exit(2)
 				}
 				i += 4
+
+			case "verify":
+				m, _ := st.Meta.(*core.FitMeta)
+				if m == nil || m.F == nil {
+					fmt.Fprintln(os.Stderr, "no FIT loaded")
+					os.Exit(2)
+				}
+				if i+2 < len(args) && !strings.HasPrefix(args[i+2], "-") {
+					ok, err := m.F.VerifyOne(args[i+2])
+					if err != nil {
+						fmt.Fprintln(os.Stderr, err)
+						os.Exit(2)
+					}
+					if !ok {
+						fmt.Fprintln(os.Stderr, "verify: mismatch")
+						os.Exit(2)
+					}
+					fmt.Println("OK")
+					i += 3
+				} else {
+					if err := m.F.Verify(); err != nil {
+						fmt.Fprintln(os.Stderr, err)
+						os.Exit(2)
+					}
+					fmt.Println("OK")
+					i += 2
+				}
+
 			default:
 				fmt.Fprintln(os.Stderr, "unknown fit action:", a)
+				os.Exit(2)
+			}
+
+		case "image":
+			if i+1 >= len(args) {
+				usage()
+				os.Exit(1)
+			}
+			sub := args[i+1]
+			switch sub {
+			case "resize":
+				if i+3 >= len(args) {
+					fmt.Fprintln(os.Stderr, "usage: image resize <path> (+SIZE|-SIZE|--to SIZE[K|M|G])")
+					os.Exit(1)
+				}
+				path := args[i+2]
+				spec := args[i+3]
+				var err error
+				if strings.HasPrefix(spec, "+") || strings.HasPrefix(spec, "-") {
+					sign := spec[0]
+					v, perr := core.ParseSize(spec[1:])
+					if perr != nil {
+						fmt.Fprintln(os.Stderr, perr)
+						os.Exit(2)
+					}
+					if sign == '-' {
+						v = -v
+					}
+					err = core.ResizeFileDelta(path, v)
+				} else if spec == "--to" {
+					if i+4 >= len(args) {
+						fmt.Fprintln(os.Stderr, "usage: image resize <path> --to SIZE[K|M|G]")
+						os.Exit(1)
+					}
+					sizeStr := args[i+4]
+					v, perr := core.ParseSize(sizeStr)
+					if perr != nil {
+						fmt.Fprintln(os.Stderr, perr)
+						os.Exit(2)
+					}
+					err = core.ResizeFileTo(path, v)
+					i++
+				} else if strings.HasPrefix(spec, "--to=") {
+					sizeStr := strings.TrimPrefix(spec, "--to=")
+					v, perr := core.ParseSize(sizeStr)
+					if perr != nil {
+						fmt.Fprintln(os.Stderr, perr)
+						os.Exit(2)
+					}
+					err = core.ResizeFileTo(path, v)
+				} else {
+					fmt.Fprintln(os.Stderr, "usage: image resize <path> (+SIZE|-SIZE|--to SIZE[K|M|G])")
+					os.Exit(1)
+				}
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "resize:", err)
+					os.Exit(2)
+				}
+				i += 4
+
+			case "pad":
+				if i+3 >= len(args) {
+					fmt.Fprintln(os.Stderr, "usage: image pad <path> --align SIZE[K|M|G]")
+					os.Exit(1)
+				}
+				path := args[i+2]
+				arg := args[i+3]
+				var sizeStr string
+				if strings.HasPrefix(arg, "--align=") {
+					sizeStr = strings.TrimPrefix(arg, "--align=")
+				} else if arg == "--align" && i+4 < len(args) {
+					sizeStr = args[i+4]
+					i++
+				} else {
+					fmt.Fprintln(os.Stderr, "usage: image pad <path> --align SIZE[K|M|G]")
+					os.Exit(1)
+				}
+				v, perr := core.ParseSize(sizeStr)
+				if perr != nil {
+					fmt.Fprintln(os.Stderr, perr)
+					os.Exit(2)
+				}
+				if err := core.PadAlign(path, v); err != nil {
+					fmt.Fprintln(os.Stderr, "pad:", err)
+					os.Exit(2)
+				}
+				i += 4
+
+			default:
+				fmt.Fprintln(os.Stderr, "unknown image action:", sub)
 				os.Exit(2)
 			}
 
@@ -473,6 +805,18 @@ func main() {
 					os.Exit(2)
 				}
 				i += 3
+			case "tar":
+				out := args[i+2]
+				comp := "none"
+				if i+3 < len(args) {
+					comp = args[i+3]
+					i++
+				}
+				if err := st.StoreTar(out, comp); err != nil {
+					fmt.Fprintln(os.Stderr, "store:", err)
+					os.Exit(2)
+				}
+				i += 3
 			default:
 				fmt.Fprintln(os.Stderr, "unknown store type:", typ)
 				os.Exit(2)
@@ -492,6 +836,8 @@ func main() {
 		_ = st.SaveSession(sessionPath)
 	}
 }
+
+// util
 
 func printEntryLine(e *memfs.Entry) {
 	t := "-"
@@ -517,7 +863,6 @@ func printEntryLine(e *memfs.Entry) {
 		t, uint32(e.Mode)&0o7777, e.UID, e.GID, size, name)
 }
 
-// resolvePathFollow: если follow = true и p — симлинк, разыменовываем до реального пути.
 func resolvePathFollow(fs *memfs.FS, p string, follow bool) (string, *memfs.Entry) {
 	p = filepath.ToSlash(p)
 	if p == "" {
@@ -531,7 +876,6 @@ func resolvePathFollow(fs *memfs.FS, p string, follow bool) (string, *memfs.Entr
 		return p, snap[p]
 	}
 
-	// пошаговое разрешение по компонентам пути
 	limit := 40
 	cur := "/"
 	rest := strings.Split(strings.TrimPrefix(p, "/"), "/")
@@ -554,7 +898,6 @@ func resolvePathFollow(fs *memfs.FS, p string, follow bool) (string, *memfs.Entr
 		if e == nil {
 			return next, nil
 		}
-		// если симлинк — подставляем цель и продолжаем
 		if e.Mode&memfs.ModeLink != 0 {
 			tgt := e.Target
 			if tgt == "" {
@@ -583,10 +926,8 @@ func resolvePathFollow(fs *memfs.FS, p string, follow bool) (string, *memfs.Entr
 			rest = strings.Split(strings.TrimPrefix(newPath, "/"), "/")
 			continue
 		}
-		// обычный узел — шагаем дальше
 		cur = next
 		rest = rest[1:]
 	}
-	// защита от циклов
 	return cur, snap[cur]
 }
