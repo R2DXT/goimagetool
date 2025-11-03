@@ -125,6 +125,26 @@ Replace ramdisk in a FIT image:
 GOIMAGETOOL_SESSION=/tmp/gt.session ./goimagetool load kernel-fit artifacts/kernel.itb auto   fit add ramdisk dist/initramfs.patched.cpio.gz   store kernel-fit dist/kernel.patched.itb none
 ```
 
-./goimagetool fm 
-<img width="1734" height="816" alt="image" src="https://github.com/user-attachments/assets/78a1a5bb-3bee-4fba-9e89-09f472c8813d" />
+##TUI file manager (fm)
+
+Two-pane TUI (VolkovCommander-style): left = in-memory image FS, right = host FS.
+
+Run
+```bash
+# with a saved session
+goimagetool --session auto fm
+
+# example end-to-end
+goimagetool --session auto load initramfs rootfs.cpio.gz auto
+goimagetool --session auto fm
+
+# start right pane at a dir
+goimagetool fm /tmp
+```
+Keys
+
+TAB switch pane, ↑/↓ move, ENTER open dir, ← up
+
+F1 help, F10/ESC quit<img width="1731" height="782" alt="image" src="https://github.com/user-attachments/assets/f9da0b35-893d-4788-b794-677cbc72a7cd" />
+
 
