@@ -18,8 +18,8 @@ func mkfifo(path string, perm uint32) error {
 
 func mknod(path string, e *memfs.Entry, maj, min uint32) error {
 	mode := uint32(e.Mode) & 0o7777
-	var t uint32 = syscall.S_IFCHR
-	if (e.Mode & memfs.ModeBlock) != 0 {
+	t := uint32(syscall.S_IFCHR)
+	if e.Mode&memfs.ModeBlock != 0 {
 		t = syscall.S_IFBLK
 	}
 	rdev := (maj << 8) | (min & 0xff) | ((min &^ 0xff) << 12)
