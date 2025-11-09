@@ -32,12 +32,14 @@ func uidOf(fi os.FileInfo) uint32 {
 	}
 	return 0
 }
+
 func gidOf(fi os.FileInfo) uint32 {
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 		return uint32(st.Gid)
 	}
 	return 0
 }
+
 func rdevOf(fi os.FileInfo) (uint32, uint32) {
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 		r := uint32(st.Rdev)

@@ -1,150 +1,97 @@
 # goimagetool
 
-Unified image tool (Go).
+Single-binary utility to inspect, modify, and (re)pack common Linux image formats using an in-memory filesystem.
 
-## Features
-- **Initramfs (CPIO newc)** — read/write, compression: `auto/none/gzip/zstd/lz4/lzma/bzip2/xz`.
-- **U-Boot uImage (legacy)** — read/write (header, CRC, payload).
-- **U-Boot FIT/ITB** — CRUD + write (MVP): `fit new/ls/add/rm/set-default/extract`.
-- **SquashFS v4** — read/write via `go-diskfs` (gzip/xz/zstd/lz4/lzo/lzma), preserves `mode/mtime`, best-effort `uid/gid` (Unix).
-- **EXT2** — write (fsck-clean) via `mke2fs -d`, preserves `mode/mtime`, best-effort `uid/gid`.
-- **In-memory FS (memfs)** — files/dirs/symlinks/devnodes; helpers:
-  - `fs ls` (**`-L` follow symlinks**), `fs add`, `fs extract`, `fs ln -s`, `fs mknod`.
-- **Sessions** — persist state between runs: `--session` or `GOIMAGETOOL_SESSION`.
+## Formats
 
-> Cross-platform build: Linux / macOS / Windows / FreeBSD.  
-> Note: EXT2 write requires **`mke2fs`** (package *e2fsprogs*) on the host.
+- **Initramfs (CPIO newc)** — read/write. Compression: none, gzip, zstd, xz, lz4, bzip2, lzma.
+    
+- **U-Boot legacy (uImage)** — read/write (CRC).
+    
+- **U-Boot FIT/ITB** — read/write; list/add/remove images, set default, verify, extract.
+    
+- **EXT2**
+    
+    - Read: native reader (RO).
+        
+    - Write: via `mke2fs` (requires `mke2fs` on Unix).
+        
+- **SquashFS** — load/store with basic options.
+    
+- **Tar / Tar.gz** — read (RO) and store (tar, tgz).
+    
+- **MemFS** — internal editable view: files, dirs, symlinks, char/block/fifo, mode/uid/gid/mtime.
+    
 
----
+## Build
 
-## Install / Build
+`go build ./cmd/goimagetool ./goimagetool -h`
 
-```bash
-go build ./cmd/goimagetool
-./goimagetool -h
-```
+## Session
 
-Optional deps:
-- EXT2 write: `sudo apt-get install -y e2fsprogs` (Linux) / `brew install e2fsprogs` (macOS).
+State can persist across runs.
 
----
+`# auto session in XDG_RUNTIME_DIR GOIMAGETOOL_SESSION=auto ./goimagetool load auto rootfs.cpio.gz fs ls /  # or explicit ./goimagetool --session ~/.cache/goimagetool/session.json load auto rootfs.cpio.gz ./goimagetool --session ~/.cache/goimagetool/session.json fs ls /`
 
-## Quick start
+## Commands
 
-### Explore an initramfs (cpio.gz)
-```bash
-./goimagetool --session   load initramfs rootfs.cpio.gz auto   fs ls /
-```
+### Load
 
-Follow symlinks (e.g. `/lib -> /usr/lib`):
-```bash
-./goimagetool --session fs ls -L /lib
-```
+`# Auto-detect format and compression goimagetool load auto path/to/image  # Initramfs (cpio newc), compression: auto|none|gzip|zstd|xz|lz4|bzip2|lzma goimagetool load initramfs rootfs.cpio.gz auto  # U-Boot goimagetool load kernel-legacy uImage goimagetool load kernel-fit   kernel.itb auto  # SquashFS goimagetool load squashfs rootfs.sqsh auto  # EXT2 goimagetool load ext2 rootfs.ext2 none  # Tar / Tar.gz goimagetool load tar rootfs.tar.gz gzip`
 
-### Add a file and repack
-```bash
-./goimagetool --session   fs add ./ssh/authorized_keys /root/.ssh/authorized_keys   store initramfs out.cpio.gz gzip
-```
+### Store
 
-### SquashFS round-trip
-```bash
-./goimagetool --session   load squashfs rootfs.squashfs   fs ls /etc   store squashfs out.sqsh zstd
-```
+`# Initramfs goimagetool store initramfs out.cpio.gz gzip  # U-Boot goimagetool store kernel-legacy out.uImage goimagetool store kernel-fit    out.itb none  # SquashFS (compression: gzip|xz|zstd|lz4|lzo|lzma) goimagetool store squashfs out.sqsh zstd  # EXT2 (block size: 1024|2048|4096; requires mke2fs on Unix) goimagetool store ext2 out.ext2 4096 none  # Tar / Tar.gz goimagetool store tar out.tar.gz gzip`
 
-### Build an EXT2 image (fsck-clean)
-```bash
-./goimagetool --session   load initramfs rootfs.cpio.gz auto   store ext2 out.ext2 4096
+### Filesystem (MemFS)
 
-# optional validation (Linux):
-e2fsck -fn out.ext2
-```
+`# List (optionally follow symlinks with -L) goimagetool fs ls / goimagetool fs ls -L /lib  # Add from host into image goimagetool fs add ./busybox /bin/busybox  # Extract image FS to host directory goimagetool fs extract ./out_rootfs  # Create symlink in image goimagetool fs ln -s /bin/busybox /bin/sh  # Create device/fifo in image goimagetool fs mknod c 1 3  /dev/null goimagetool fs mknod b 8 0  /dev/sda goimagetool fs mknod p 0 0  /run/myfifo`
 
-### FIT/ITB basics
-```bash
-# create empty FIT, add ramdisk, set default, write ITB
-./goimagetool --session fit new
-./goimagetool --session fit add ramdisk ./out.cpio.gz
-./goimagetool --session fit set-default ramdisk
-./goimagetool --session store kernel-fit kernel.itb none
+### FIT/ITB
 
-# list/extract from existing ITB
-./goimagetool --session load kernel-fit kernel.itb auto
-./goimagetool --session fit ls
-./goimagetool --session fit extract ramdisk ./ramdisk.cpio.gz
-```
+`# Start empty FIT goimagetool fit new  # List entries (mark * is default) goimagetool fit ls  # Add image with type/hash goimagetool fit add -t kernel -H sha256 kernel /path/to/zImage  # Set default entry goimagetool fit set-default kernel  # Extract entry to file goimagetool fit extract kernel zImage.out  # Verify hashes (all or one) goimagetool fit verify goimagetool fit verify kernel  # Remove entry goimagetool fit rm kernel`
 
-### Extract entire FS to host
-```bash
-./goimagetool --session fs extract ./out_dir
-```
+### Sessions
 
----
+`goimagetool session save goimagetool session load goimagetool session clear`
 
-## CLI reference
+### Info
 
-```
-load  initramfs <path> [compression]           # compression: auto|none|gzip|zstd|lz4|lzma|bzip2|xz
-load  kernel-legacy <uImage>
-load  kernel-fit    <itb> [compression]
-load  squashfs      <img> [compression]
-load  ext2          <img> [compression]
+`goimagetool info`
 
-store initramfs     <out> [compression]
-store kernel-legacy <out>
-store kernel-fit    <out> [compression]
-store squashfs      <out> [compression]        # gzip|xz|zstd|lz4|lzo|lzma
-store ext2          <out> [blockSize] [compression]  # blockSize: 1024|2048|4096
+### TUI (two-panel, experimental)
 
-fs ls [-L] [path]
-fs add <src> <dst-in-image>
-fs extract <dst-dir>
-fs ln -s <target> <dst>
-fs mknod <c|b|p> <major> <minor> <dst>
+`# Optional file manager goimagetool fm             # host start = $PWD goimagetool fm /var/tmp    # explicit host start`
 
-fit new | ls | add <name> <file> | rm <name> | set-default <name> | extract <name> <out>
+### Raw image size helpers
 
-session save [path] | load [path] | clear
-info
-```
+`# Resize raw file: +K|M|G, -K|M|G, or --to SIZE[K|M|G] goimagetool image resize /path/to/image.img +512M goimagetool image resize /path/to/image.img -256M goimagetool image resize /path/to/image.img --to 2G  # Pad to alignment (--align SIZE[K|M|G]) goimagetool image pad /path/to/image.img --align 1M`
 
-Sessions:
-- `--session` without path → default location.
-- Or set `GOIMAGETOOL_SESSION=/path/to/session`.
+## Examples
 
----
+Inspect and repack initramfs:
 
-## CI usage (snippets)
+`goimagetool load initramfs initrd.cpio.zst auto goimagetool fs ls /sbin goimagetool fs add ./mytool /usr/bin/mytool goimagetool store initramfs initrd.new.cpio.gz gzip`
 
-Inject a file into initramfs:
-```bash
-GOIMAGETOOL_SESSION=/tmp/gt.session ./goimagetool load initramfs artifacts/initramfs.cpio.gz auto   fs add ./files/sshd_config /etc/ssh/sshd_config   store initramfs dist/initramfs.patched.cpio.gz gzip
-```
+Modify FIT:
 
-Replace ramdisk in a FIT image:
-```bash
-GOIMAGETOOL_SESSION=/tmp/gt.session ./goimagetool load kernel-fit artifacts/kernel.itb auto   fit add ramdisk dist/initramfs.patched.cpio.gz   store kernel-fit dist/kernel.patched.itb none
-```
+`goimagetool load kernel-fit kernel.itb auto goimagetool fit ls goimagetool fit add -t fdt -H sha1 dtb /path/board.dtb goimagetool fit set-default kernel goimagetool store kernel-fit kernel.new.itb none`
 
-##TUI file manager (fm)
+Create EXT2 from a tree:
 
-Two-pane TUI (VolkovCommander-style): left = in-memory image FS, right = host FS.
+`goimagetool load initramfs /dev/null none      # start empty goimagetool fs add ./rootfs_tree / goimagetool store ext2 rootfs.ext2 4096 none   # requires mke2fs`
 
-Run
-```bash
-# with a saved session
-goimagetool --session auto fm
+Extract tar.gz quickly:
 
-# example end-to-end
-goimagetool --session auto load initramfs rootfs.cpio.gz auto
-goimagetool --session auto fm
+`goimagetool load tar rootfs.tar.gz gzip goimagetool fs extract ./unpacked`
 
-# start right pane at a dir
-goimagetool fm /tmp
-```
-Keys
+## Notes
 
-TAB switch pane, ↑/↓ move, ENTER open dir, ← up
-
-F1 help, F10/ESC quit<img width="1731" height="782" alt="image" src="https://github.com/user-attachments/assets/f9da0b35-893d-4788-b794-677cbc72a7cd" />
-
-
+- EXT2 write uses `mke2fs` (Unix). On Windows, EXT2 write is unavailable.
+    
+- EXT2 read has a native RO path; write via `mke2fs`.
+    
+- SquashFS support is basic (works for common cases).
+    
+- TUI is experimental.
+    
