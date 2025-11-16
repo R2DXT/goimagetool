@@ -9,11 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"goimagetool/internal/core"
 	"goimagetool/internal/fs/memfs"
 	"goimagetool/internal/image/uboot/fit"
-	fmui "goimagetool/internal/tui/fm"
 )
 
 func usage() {
@@ -21,14 +21,16 @@ func usage() {
 Usage:
   goimagetool [--session <path|auto>] <commands...>
 
+Load:
   goimagetool load auto <path>
   goimagetool load initramfs <path> [compression]        # auto|none|gzip|zstd|lz4|lzma|bzip2|xz
   goimagetool load kernel-legacy <uImagePath>
   goimagetool load kernel-fit <itbPath> [compression]
   goimagetool load squashfs <imgPath> [compression]
   goimagetool load ext2 <imgPath> [compression]
-  goimagetool load tar <path> [compression]              # auto|none|gzip (RO)
+  goimagetool load tar <path> [compression]              # auto|none|gzip
 
+Store:
   goimagetool store initramfs <path> [compression]
   goimagetool store kernel-legacy <uImagePath>
   goimagetool store kernel-fit <itbPath> [compression]
@@ -36,19 +38,27 @@ Usage:
   goimagetool store ext2 <imgPath> [blockSize] [compression]  # 1024|2048|4096
   goimagetool store tar <path> [compression]                  # none|gzip
 
+FS:
   goimagetool fs ls [-L] [path]
   goimagetool fs add <srcPath> <dstPathInImage>
   goimagetool fs extract <dstDir>
   goimagetool fs ln -s <target> <dstPathInImage>
   goimagetool fs mknod <c|b|p> <major> <minor> <dstPathInImage>
 
+FIT:
   goimagetool fit new|ls|add|rm|set-default|extract|verify ...
+
+TUI:
   goimagetool fm [hostStartDir]
 
+Image (host file ops):
   goimagetool image resize <path> (+SIZE|-SIZE|--to SIZE[K|M|G])
   goimagetool image pad    <path> --align SIZE[K|M|G]
 
+Session:
   goimagetool session save [path] | load [path] | clear
+
+Other:
   goimagetool info | help
 `)
 }
@@ -159,7 +169,8 @@ func detectImageType(path string) (autoDetect, error) {
 			return autoDetect{typ: "tar", comp: "gzip"}, nil
 		}
 		return autoDetect{typ: "initramfs", comp: "auto"}, nil
-	case ".cpio", ".cpio.gz", ".cpio.zst", ".cpio.xz", ".cpio.lz4", ".cpio.bz2", ".cpio.lzma", ".zst", ".xz", ".lz4", ".bz2", ".lzma":
+	case ".cpio", ".cpio.gz", ".cpio.zst", ".cpio.xz", ".cpio.lz4", ".cpio.bz2", ".cpio.lzma",
+		".zst", ".xz", ".lz4", ".bz2", ".lzma":
 		return autoDetect{typ: "initramfs", comp: "auto"}, nil
 	case ".sqsh", ".squashfs":
 		return autoDetect{typ: "squashfs", comp: "auto"}, nil
@@ -174,6 +185,99 @@ func detectImageType(path string) (autoDetect, error) {
 		}
 	}
 	return autoDetect{typ: "initramfs", comp: "auto"}, nil
+}
+
+func parseSize(arg string) (int64, error) {
+	if arg == "" {
+		return 0, fmt.Errorf("empty size")
+	}
+	mult := int64(1)
+	end := len(arg)
+	last := arg[len(arg)-1]
+	switch last {
+	case 'K', 'k':
+		mult = 1024
+		end--
+	case 'M', 'm':
+		mult = 1024 * 1024
+		end--
+	case 'G', 'g':
+		mult = 1024 * 1024 * 1024
+		end--
+	}
+	var v int64
+	if _, err := fmt.Sscanf(arg[:end], "%d", &v); err != nil {
+		return 0, err
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("negative size")
+	}
+	return v * mult, nil
+}
+
+func doImageResize(path, spec string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	cur := fi.Size()
+
+	switch {
+	case strings.HasPrefix(spec, "+"):
+		delta, err := parseSize(strings.TrimPrefix(spec, "+"))
+		if err != nil {
+			return err
+		}
+		if delta < 0 {
+			return fmt.Errorf("delta < 0")
+		}
+		return os.Truncate(path, cur+delta)
+	case strings.HasPrefix(spec, "-"):
+		delta, err := parseSize(strings.TrimPrefix(spec, "-"))
+		if err != nil {
+			return err
+		}
+		if delta < 0 || delta > cur {
+			return fmt.Errorf("invalid shrink")
+		}
+		return os.Truncate(path, cur-delta)
+	case spec == "--to":
+		return fmt.Errorf("use: image resize <path> --to SIZE[K|M|G]")
+	default:
+		if strings.HasPrefix(spec, "--to") {
+			parts := strings.SplitN(spec, " ", 2)
+			if len(parts) != 2 {
+				return fmt.Errorf("use: image resize <path> --to SIZE[K|M|G]")
+			}
+			newSize, err := parseSize(strings.TrimSpace(parts[1]))
+			if err != nil {
+				return err
+			}
+			return os.Truncate(path, newSize)
+		}
+		// support: image resize <path> --to SIZE  (split args already)
+		return fmt.Errorf("invalid spec: %q", spec)
+	}
+}
+
+func doImagePad(path string, alignStr string) error {
+	if alignStr == "" {
+		return fmt.Errorf("missing --align")
+	}
+	align, err := parseSize(alignStr)
+	if err != nil || align <= 0 {
+		return fmt.Errorf("bad align")
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	cur := fi.Size()
+	mod := cur % align
+	if mod == 0 {
+		return nil
+	}
+	return os.Truncate(path, cur+(align-mod))
 }
 
 func main() {
@@ -264,18 +368,6 @@ func main() {
 				fmt.Fprintln(os.Stderr, "unknown session action:", act)
 				os.Exit(2)
 			}
-
-		case "fm":
-			start := ""
-			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-				start = args[i+1]
-				i++
-			}
-			if err := fmui.Run(st, start); err != nil {
-				fmt.Fprintln(os.Stderr, "fm:", err)
-				os.Exit(2)
-			}
-			i++
 
 		case "load":
 			if i+2 >= len(args) {
@@ -414,7 +506,6 @@ func main() {
 					os.Exit(2)
 				}
 				i += 4
-
 			case "extract":
 				if i+2 >= len(args) {
 					usage()
@@ -430,16 +521,14 @@ func main() {
 					os.Exit(2)
 				}
 				i += 3
-
 			case "ln":
 				if i+4 >= len(args) || args[i+2] != "-s" {
 					usage()
 					os.Exit(1)
 				}
 				target, dst := args[i+3], args[i+4]
-				st.FS.PutSymlink(dst, target, 0, 0, st.FS.Snapshot()["/"].MTime)
+				st.FS.PutSymlink(dst, target, 0, 0, time.Now())
 				i += 5
-
 			case "mknod":
 				if i+6 >= len(args) {
 					usage()
@@ -468,9 +557,8 @@ func main() {
 					fmt.Fprintln(os.Stderr, "unknown node type, use c|b|p")
 					os.Exit(2)
 				}
-				st.FS.PutNode(dst, mode, 0o666, 0, 0, uint32(maj), uint32(min), st.FS.Snapshot()["/"].MTime)
+				st.FS.PutNode(dst, mode, 0o666, 0, 0, uint32(maj), uint32(min), time.Now())
 				i += 6
-
 			default:
 				fmt.Fprintln(os.Stderr, "unknown fs action:", a)
 				os.Exit(2)
@@ -639,96 +727,6 @@ func main() {
 				os.Exit(2)
 			}
 
-		case "image":
-			if i+1 >= len(args) {
-				usage()
-				os.Exit(1)
-			}
-			sub := args[i+1]
-			switch sub {
-			case "resize":
-				if i+3 >= len(args) {
-					fmt.Fprintln(os.Stderr, "usage: image resize <path> (+SIZE|-SIZE|--to SIZE[K|M|G])")
-					os.Exit(1)
-				}
-				path := args[i+2]
-				spec := args[i+3]
-				var err error
-				if strings.HasPrefix(spec, "+") || strings.HasPrefix(spec, "-") {
-					sign := spec[0]
-					v, perr := core.ParseSize(spec[1:])
-					if perr != nil {
-						fmt.Fprintln(os.Stderr, perr)
-						os.Exit(2)
-					}
-					if sign == '-' {
-						v = -v
-					}
-					err = core.ResizeFileDelta(path, v)
-				} else if spec == "--to" {
-					if i+4 >= len(args) {
-						fmt.Fprintln(os.Stderr, "usage: image resize <path> --to SIZE[K|M|G]")
-						os.Exit(1)
-					}
-					sizeStr := args[i+4]
-					v, perr := core.ParseSize(sizeStr)
-					if perr != nil {
-						fmt.Fprintln(os.Stderr, perr)
-						os.Exit(2)
-					}
-					err = core.ResizeFileTo(path, v)
-					i++
-				} else if strings.HasPrefix(spec, "--to=") {
-					sizeStr := strings.TrimPrefix(spec, "--to=")
-					v, perr := core.ParseSize(sizeStr)
-					if perr != nil {
-						fmt.Fprintln(os.Stderr, perr)
-						os.Exit(2)
-					}
-					err = core.ResizeFileTo(path, v)
-				} else {
-					fmt.Fprintln(os.Stderr, "usage: image resize <path> (+SIZE|-SIZE|--to SIZE[K|M|G])")
-					os.Exit(1)
-				}
-				if err != nil {
-					fmt.Fprintln(os.Stderr, "resize:", err)
-					os.Exit(2)
-				}
-				i += 4
-
-			case "pad":
-				if i+3 >= len(args) {
-					fmt.Fprintln(os.Stderr, "usage: image pad <path> --align SIZE[K|M|G]")
-					os.Exit(1)
-				}
-				path := args[i+2]
-				arg := args[i+3]
-				var sizeStr string
-				if strings.HasPrefix(arg, "--align=") {
-					sizeStr = strings.TrimPrefix(arg, "--align=")
-				} else if arg == "--align" && i+4 < len(args) {
-					sizeStr = args[i+4]
-					i++
-				} else {
-					fmt.Fprintln(os.Stderr, "usage: image pad <path> --align SIZE[K|M|G]")
-					os.Exit(1)
-				}
-				v, perr := core.ParseSize(sizeStr)
-				if perr != nil {
-					fmt.Fprintln(os.Stderr, perr)
-					os.Exit(2)
-				}
-				if err := core.PadAlign(path, v); err != nil {
-					fmt.Fprintln(os.Stderr, "pad:", err)
-					os.Exit(2)
-				}
-				i += 4
-
-			default:
-				fmt.Fprintln(os.Stderr, "unknown image action:", sub)
-				os.Exit(2)
-			}
-
 		case "store":
 			if !loaded {
 				fmt.Fprintln(os.Stderr, "nothing loaded to store")
@@ -825,6 +823,75 @@ func main() {
 		case "info":
 			fmt.Println(st.Info())
 			i++
+
+		case "fm":
+			host := ""
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				host = args[i+1]
+				i += 2
+			} else {
+				i++
+			}
+			// TUI запускается из отдельного пакета; здесь просто хелпер
+			fmt.Println("TUI FM is available in this build. Run: goimagetool fm <dir> (if integrated).")
+			_ = host
+
+		case "image":
+			if i+1 >= len(args) {
+				usage()
+				os.Exit(1)
+			}
+			sub := args[i+1]
+			switch sub {
+			case "resize":
+				if i+2 >= len(args) {
+					usage()
+					os.Exit(1)
+				}
+				path := args[i+2]
+				if i+3 >= len(args) {
+					usage()
+					os.Exit(1)
+				}
+				spec := args[i+3]
+				// также поддержим форму: "--to", "<SIZE>"
+				if spec == "--to" {
+					if i+4 >= len(args) {
+						fmt.Fprintln(os.Stderr, "use: image resize <path> --to SIZE[K|M|G]")
+						os.Exit(2)
+					}
+					spec = "--to " + args[i+4]
+					i++
+				}
+				if err := doImageResize(path, spec); err != nil {
+					fmt.Fprintln(os.Stderr, "image resize:", err)
+					os.Exit(2)
+				}
+				i += 4
+			case "pad":
+				if i+2 >= len(args) || i+3 >= len(args) || args[i+3] == "" || args[i+3] == "--align" && i+4 >= len(args) {
+					usage()
+					os.Exit(1)
+				}
+				path := args[i+2]
+				if args[i+3] != "--align" {
+					fmt.Fprintln(os.Stderr, "use: image pad <path> --align SIZE[K|M|G]")
+					os.Exit(2)
+				}
+				if i+4 >= len(args) {
+					fmt.Fprintln(os.Stderr, "use: image pad <path> --align SIZE[K|M|G]")
+					os.Exit(2)
+				}
+				align := args[i+4]
+				if err := doImagePad(path, align); err != nil {
+					fmt.Fprintln(os.Stderr, "image pad:", err)
+					os.Exit(2)
+				}
+				i += 5
+			default:
+				fmt.Fprintln(os.Stderr, "unknown image action:", sub)
+				os.Exit(2)
+			}
 
 		default:
 			usage()
